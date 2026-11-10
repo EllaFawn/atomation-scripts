@@ -4,10 +4,31 @@ brute_force_detector.py
 Parses an SSH auth log, flags IPs with repeated failed logins inside a short
 time window (likely brute-force attempts) and writes incident and summary reports.
 """
+import ipaddress
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
 
-LOGFILE = "sample_auth_small.log"
+# Resolved relative to this script so it can be run from any directory
+LOGFILE = Path(__file__).resolve().parent / "sample_auth_small.log"
+
+
+def parse_syslog_timestamp(ts_str, now=None):
+    """
+    Parse a syslog timestamp like 'Mar 10 13:58:01', which has no year.
+    Uses the most recent year that gives a valid date not in the future
+    (so a Dec log read in Jan gets last year, and Feb 29 gets a leap year).
+    Returns None if it can't be parsed.
+    """
+    now = now or datetime.now()
+    for year in range(now.year, now.year - 8, -1):
+        try:
+            ts = datetime.strptime(f"{year} {ts_str}", "%Y %b %d %H:%M:%S")
+        except ValueError:
+            continue
+        if ts <= now + timedelta(days=1):
+            return ts
+    return None
 
 
 def parse_auth_line(line):
@@ -17,35 +38,36 @@ def parse_auth_line(line):
     Example auth line:
     Mar 10 13:58:01 host1 sshd[1023]: Failed password for invalid user admin from 203.0.113.45 port 52344 ssh2
 
-     - timestamp: parsed from the first 3 tokens (year assumed to be 2025)
-     - ip: the token after 'from'
+     - timestamp: parsed from the first 3 tokens (year inferred, see parse_syslog_timestamp)
+     - ip: the valid IP after the last 'from' (the username can contain a fake 'from <ip>')
      - event_type: 'failed' if 'Failed password', 'accepted' if 'Accepted password', else 'other'
     """
     parts = line.split()
     # timestamp: first 3 tokens 'Mar 10 13:58:01'
-    ts_str = " ".join(parts[0:3])
-    try:
-        ts = datetime.strptime(f"2025 {ts_str}", "%Y %b %d %H:%M:%S")
-    except Exception:
-        ts = None
+    ts = parse_syslog_timestamp(" ".join(parts[0:3]))
     ip = None
     event_type = "other"
     if "Failed password" in line:
         event_type = "failed"
     elif "Accepted password" in line or "Accepted publickey" in line:
         event_type = "accepted"
-    if " from " in line:
-        try:
-            idx = parts.index("from")
-            ip = parts[idx + 1]
-        except (ValueError, IndexError):
-            ip = None
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i] == "from":
+            candidate = parts[i + 1].rstrip(":")
+            try:
+                ipaddress.ip_address(candidate)
+                ip = candidate
+                break
+            except ValueError:
+                continue
     return ts, ip, event_type
 
 
 def detect_brute_force(per_ip_timestamps, max_minutes=10, threshold=5):
     """
     Detect IPs with >= threshold failures within a max_minutes window.
+    Overlapping suspicious windows are merged into one incident covering the
+    whole attack, and separate attacks from the same IP are reported separately.
     Return a list of incident dicts (ip, count, start_time, end_time, duration_minutes).
     """
     incidents = []
@@ -55,6 +77,8 @@ def detect_brute_force(per_ip_timestamps, max_minutes=10, threshold=5):
             continue
         # Use two pointers (sliding window)
         left = 0
+        # indexes of the first and last attempt in the incident being built
+        start_idx = end_idx = None
         for right in range(len(timestamps)):
             # Move left pointer until window is <= max_minutes
             while timestamps[right] - timestamps[left] > timedelta(minutes=max_minutes):
@@ -62,18 +86,27 @@ def detect_brute_force(per_ip_timestamps, max_minutes=10, threshold=5):
             window_size = right - left + 1
             # check if current window meets threshold
             if window_size >= threshold:
-                # found suspicious activity
-                incident = {
-                    'ip': ip,
-                    'count': window_size,
-                    'start_time': timestamps[left],
-                    'end_time': timestamps[right],
-                    'duration_minutes': (timestamps[right] - timestamps[left]).total_seconds() / 60
-                }
-                incidents.append(incident)
-                # stop after the first incident for this IP to avoid duplicate reports
-                break
+                if start_idx is not None and left <= end_idx:
+                    # overlaps the current incident, so extend it
+                    end_idx = right
+                else:
+                    # found a new burst of suspicious activity
+                    if start_idx is not None:
+                        incidents.append(_make_incident(ip, timestamps, start_idx, end_idx))
+                    start_idx, end_idx = left, right
+        if start_idx is not None:
+            incidents.append(_make_incident(ip, timestamps, start_idx, end_idx))
     return incidents
+
+
+def _make_incident(ip, timestamps, start_idx, end_idx):
+    return {
+        'ip': ip,
+        'count': end_idx - start_idx + 1,
+        'start_time': timestamps[start_idx],
+        'end_time': timestamps[end_idx],
+        'duration_minutes': (timestamps[end_idx] - timestamps[start_idx]).total_seconds() / 60
+    }
 
 
 def save_incidents_to_file(incidents, filename="bruteforce_incidents.txt"):
@@ -127,7 +160,7 @@ def plot_attackers_chart(per_ip_timestamps, top_n=10):
 
     plt.figure(figsize=(10, 6))
     bars = plt.bar(ips, counts, color='red')
-    plt.title(f'Top {top_n} IPs by Failed Login Attempts')
+    plt.title(f'Top {len(top_ips)} IPs by Failed Login Attempts')
     plt.xlabel('IP Address')
     plt.ylabel('Number of Failed Attempts')
 
@@ -137,7 +170,8 @@ def plot_attackers_chart(per_ip_timestamps, top_n=10):
     plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
     plt.savefig('top_attackers.png')
-    plt.show()
+    plt.close()
+    print("Chart saved to top_attackers.png")
 
 
 if __name__ == "__main__":
@@ -164,3 +198,8 @@ if __name__ == "__main__":
     # Write reports to files
     save_incidents_to_file(incidents, filename="bruteforce_incidents.txt")
     create_summary_report(per_ip_timestamps, filename="summary_report.txt")
+
+    try:
+        plot_attackers_chart(per_ip_timestamps)
+    except ImportError:
+        print("matplotlib not installed, skipping chart (pip install matplotlib)")

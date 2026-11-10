@@ -4,26 +4,31 @@ failed_login_counter.py
 Counts failed SSH password attempts per IP address in an auth log,
 prints the top 5 offenders and writes all counts to failed_counts.txt.
 """
+import ipaddress
 import time
 from collections import defaultdict
+from pathlib import Path
 
-LOGFILE = "sample_auth_small.log"
+# Resolved relative to this script so it can be run from any directory
+LOGFILE = Path(__file__).resolve().parent / "sample_auth_small.log"
 
 
 def extract_ip(line):
     """
     Extracts the IP address from a log line using token-based extraction.
-    Looks for the token 'from' and returns the next token as the IP address.
-    Returns None if not found.
+    Uses the last 'from <ip>' in the line, because sshd writes the real source
+    address after the username, and an attacker can put 'from <fake ip>' in the
+    username. Returns None if not found.
     """
-    if " from " in line:
-        parts = line.split()
-        try:
-            anchor = parts.index("from")
-            ip = parts[anchor + 1]
-            return ip.strip()
-        except (ValueError, IndexError):
-            return None
+    parts = line.split()
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i] == "from":
+            candidate = parts[i + 1].rstrip(":")
+            try:
+                ipaddress.ip_address(candidate)
+                return candidate
+            except ValueError:
+                continue
     return None
 
 

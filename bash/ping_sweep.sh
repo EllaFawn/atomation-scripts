@@ -15,19 +15,29 @@ ping_sweep() {
         return 1
     fi
 
-    subnet="$1"
+    local subnet="$1"
+
+    # 1 second reply timeout: -W is seconds on Linux but milliseconds on macOS, which uses -t instead
+    local timeout_flag="-W"
+    [ "$(uname)" = "Darwin" ] && timeout_flag="-t"
 
     echo "Starting ping sweep for $subnet.1 - $subnet.10..."
 
-    for i in {1..10}; do
-        ip="$subnet.$i"
-        ping -c1 -w1 "$ip" &> /dev/null && echo "[+] $ip alive" &
-    done
-    wait
+    # The subshell stops the shell printing job numbers for every background ping
+    (
+        for i in {1..10}; do
+            ping -c1 "$timeout_flag" 1 "$subnet.$i" &> /dev/null && echo "[+] $subnet.$i alive" &
+        done
+        wait
+    )
 
     echo "Scan complete."
 }
 
-check_host() { ping -c1 "$1" &>/dev/null && echo "$1 is up" || echo "$1 is down"; }
+check_host() {
+    local timeout_flag="-W"
+    [ "$(uname)" = "Darwin" ] && timeout_flag="-t"
+    ping -c1 "$timeout_flag" 1 "$1" &> /dev/null && echo "$1 is up" || echo "$1 is down"
+}
 
-rot13() { echo "$1" | tr 'A-Za-z' 'N-ZA-Mn-za-m'; }
+rot13() { printf '%s\n' "$*" | tr 'A-Za-z' 'N-ZA-Mn-za-m'; }

@@ -20,12 +20,22 @@ ping_ip_list() {
         return 1
     fi
 
+    # 1 second reply timeout: -W is seconds on Linux but milliseconds on macOS, which uses -t instead
+    local timeout_flag="-W"
+    [ "$(uname)" = "Darwin" ] && timeout_flag="-t"
+
     local temp_file=$(mktemp)
 
-    grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "$filename" | while read ip; do
-        ping -c1 -W1 "$ip" &> /dev/null; echo "$ip is alive" >> "$temp_file" &
-    done
-    wait
+    # The subshell stops the shell printing job numbers for every background ping.
+    # `wait` sits inside the braces so it waits for the pings started by the loop.
+    (
+        grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' "$filename" | sort -u | {
+            while read -r ip; do
+                ping -c1 "$timeout_flag" 1 "$ip" &> /dev/null && echo "$ip is alive" >> "$temp_file" &
+            done
+            wait
+        }
+    )
 
     mv "$temp_file" "$output_file"
 
