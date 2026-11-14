@@ -10,7 +10,12 @@ Standard library only. API keys are read from the VT_API_KEY and
 ABUSEIPDB_API_KEY environment variables; sources without a key are skipped.
 """
 import ipaddress
+import json
 import re
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
@@ -206,3 +211,77 @@ def overall_verdict(iocs):
     if not scores:
         return None, "Unknown"
     return max(scores), verdict_for(max(scores))
+
+
+# ---------------------------------------------------------------------------
+# HTTP and cache
+# ---------------------------------------------------------------------------
+
+USER_AGENT = "ioc-enricher/1.0"
+DEFAULT_CACHE_PATH = Path.home() / ".cache" / "ioc_enricher" / "cache.json"
+CACHEABLE_STATUSES = {"ok", "not_found"}
+
+
+class FetchError(Exception):
+    """Network failure, timeout or unparseable response."""
+
+
+def fetch_json(url, headers=None, timeout=15):
+    """
+    GET a URL and parse the JSON body.
+
+    Returns (status_code, parsed_json_or_None, response_headers). HTTP error
+    codes are returned, not raised. Network errors, timeouts and invalid JSON
+    on a 200 raise FetchError.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status, body, resp_headers = response.status, response.read(), dict(response.headers)
+    except urllib.error.HTTPError as err:
+        return err.code, None, dict(err.headers or {})
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        raise FetchError(f"network error: {getattr(err, 'reason', err)}") from err
+    try:
+        return status, json.loads(body), resp_headers
+    except ValueError as err:
+        raise FetchError("invalid JSON in response") from err
+
+
+def cache_key(source, ioc):
+    return f"{source}:{ioc['type']}:{ioc['value']}"
+
+
+class Cache:
+    """JSON file cache of source results with a TTL. Errors are never cached."""
+
+    def __init__(self, path, ttl=86400, enabled=True, now=time.time):
+        self.path, self.ttl, self.enabled, self.now = Path(path), ttl, enabled, now
+        self.entries = {}
+        if enabled:
+            try:
+                loaded = json.loads(self.path.read_text())
+                self.entries = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                self.entries = {}  # missing or corrupt cache: start fresh
+
+    def get(self, key):
+        if not self.enabled:
+            return None
+        entry = self.entries.get(key)
+        if not isinstance(entry, dict) or self.now() - entry.get("ts", 0) > self.ttl:
+            return None
+        return entry.get("result")
+
+    def set(self, key, result):
+        if self.enabled and result.get("status") in CACHEABLE_STATUSES:
+            self.entries[key] = {"ts": self.now(), "result": result}
+
+    def save(self):
+        if not self.enabled:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.entries))
+        except OSError:
+            pass  # a cache we can't write is not worth failing the run over

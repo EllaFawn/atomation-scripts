@@ -126,5 +126,80 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(ie.overall_verdict([]), (None, "Unknown"))
 
 
+class TestHttpAndCache(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "sub" / "cache.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_cache_key(self):
+        self.assertEqual(ie.cache_key("cvedb", {"type": "cve", "value": "CVE-1-1"}), "cvedb:cve:CVE-1-1")
+
+    def test_cache_roundtrip_and_ttl(self):
+        t = [1000.0]
+        c = ie.Cache(self.path, ttl=10, now=lambda: t[0])
+        c.set("k", {"status": "ok", "score": 5})
+        c.save()
+        c2 = ie.Cache(self.path, ttl=10, now=lambda: t[0])
+        self.assertEqual(c2.get("k")["score"], 5)
+        t[0] = 1011.0
+        self.assertIsNone(c2.get("k"))
+
+    def test_errors_not_cached(self):
+        c = ie.Cache(self.path)
+        c.set("k", {"status": "error"})
+        self.assertIsNone(c.get("k"))
+
+    def test_disabled_cache(self):
+        c = ie.Cache(self.path, enabled=False)
+        c.set("k", {"status": "ok"})
+        c.save()
+        self.assertIsNone(c.get("k"))
+        self.assertFalse(self.path.exists())
+
+    def test_corrupt_cache_file(self):  # Review Focus #3
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("{not json")
+        c = ie.Cache(self.path)
+        self.assertIsNone(c.get("k"))
+        c.set("k", {"status": "ok"})
+        c.save()
+        self.assertEqual(json.loads(self.path.read_text())["k"]["result"]["status"], "ok")
+
+    def test_fetch_json_ok(self):
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.status = 200
+        resp.read.return_value = b'{"a": 1}'
+        resp.headers = {"X": "y"}
+        with mock.patch("urllib.request.urlopen", return_value=resp) as uo:
+            self.assertEqual(ie.fetch_json("http://x", {"k": "v"}), (200, {"a": 1}, {"X": "y"}))
+        req = uo.call_args[0][0]
+        self.assertEqual(req.get_header("User-agent"), "ioc-enricher/1.0")
+        self.assertEqual(uo.call_args[1]["timeout"], 15)
+
+    def test_fetch_json_returns_http_error_code(self):
+        err = urllib.error.HTTPError("u", 404, "nf", {}, io.BytesIO(b"{}"))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            self.assertEqual(ie.fetch_json("http://x")[0], 404)
+
+    def test_fetch_json_network_error_raises(self):
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+            with self.assertRaises(ie.FetchError):
+                ie.fetch_json("http://x")
+
+    def test_fetch_json_bad_json_raises(self):
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.status = 200
+        resp.read.return_value = b"<html>"
+        resp.headers = {}
+        with mock.patch("urllib.request.urlopen", return_value=resp):
+            with self.assertRaises(ie.FetchError):
+                ie.fetch_json("http://x")
+
+
 if __name__ == "__main__":
     unittest.main()
