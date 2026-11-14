@@ -139,3 +139,70 @@ def extract_iocs(text):
             else:
                 iocs.append({"type": ioc_type, "value": value})
     return {"iocs": iocs, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+# Exposed services that are commonly abused or should rarely face the internet.
+RISKY_PORTS = {21, 23, 445, 1433, 3306, 3389, 5900, 6379, 9200, 11211, 27017}
+
+VERDICT_BANDS = [(90, "Critical"), (70, "High"), (40, "Medium"), (10, "Low"), (0, "Clean")]
+
+
+def vt_score(malicious, suspicious):
+    """Engine-count based: 1-2 detections are often false positives, 10+ rarely are."""
+    if malicious == 0 and suspicious == 0:
+        return 0
+    return min(100, 20 + 8 * malicious + 4 * suspicious)
+
+
+def internetdb_score(ports, vulns, tags):
+    """
+    Exposure is not maliciousness, so plain exposure is capped at 50.
+    Only Shodan's 'compromised'/'malware' tags push an IP above that.
+    """
+    candidates = [min(50, min(40, 10 * len(vulns)) + min(30, 10 * len(set(ports) & RISKY_PORTS)))]
+    if "compromised" in tags or "malware" in tags:
+        candidates.append(80)
+    if "tor" in tags:
+        candidates.append(40)
+    return max(candidates)
+
+
+def cve_score(cvss, kev, epss):
+    """CVSS x 10, floored at 90 if on CISA KEV, +10 if EPSS >= 0.5, capped at 100."""
+    score = round((cvss or 0) * 10)
+    if kev:
+        score = max(score, 90)
+    if epss is not None and epss >= 0.5:
+        score += 10
+    return min(100, score)
+
+
+def verdict_for(score):
+    """Map a 0-100 score to a verdict band; None means no data -> Unknown."""
+    if score is None:
+        return "Unknown"
+    for floor, verdict in VERDICT_BANDS:
+        if score >= floor:
+            return verdict
+    return "Clean"
+
+
+def score_ioc(sources):
+    """Per-IoC score = highest score among sources that returned data."""
+    ok = [s for s in sources if s["status"] == "ok"]
+    if not ok:
+        return None, "Unknown", "No source returned data"
+    score = max(s["score"] for s in ok)
+    return score, verdict_for(score), " · ".join(s["reason"] for s in ok)
+
+
+def overall_verdict(iocs):
+    """Overall score = highest IoC score; Unknown if no IoC has a score."""
+    scores = [i["score"] for i in iocs if i.get("score") is not None]
+    if not scores:
+        return None, "Unknown"
+    return max(scores), verdict_for(max(scores))

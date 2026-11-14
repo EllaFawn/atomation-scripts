@@ -77,5 +77,54 @@ class TestExtraction(unittest.TestCase):
         self.assertIn("evil-mail.org", self._vals("from: bob[@]evil-mail[.]org", "domain"))
 
 
+class TestScoring(unittest.TestCase):
+    def _src(self, name, status, score, reason="r"):
+        return {"source": name, "status": status, "score": score, "reason": reason, "data": {}, "link": ""}
+
+    def test_vt_score(self):
+        self.assertEqual(ie.vt_score(0, 0), 0)
+        self.assertEqual(ie.vt_score(1, 0), 28)
+        self.assertEqual(ie.vt_score(5, 0), 60)
+        self.assertEqual(ie.vt_score(0, 2), 28)
+        self.assertEqual(ie.vt_score(10, 0), 100)
+        self.assertEqual(ie.vt_score(30, 5), 100)
+
+    def test_internetdb_score(self):
+        self.assertEqual(ie.internetdb_score([443], [], []), 0)
+        self.assertEqual(ie.internetdb_score([23, 3389], ["CVE-1"], []), 30)
+        self.assertEqual(ie.internetdb_score([21, 23, 445, 3389], ["a", "b", "c", "d", "e"], []), 50)
+        self.assertEqual(ie.internetdb_score([], [], ["tor"]), 40)
+        self.assertEqual(ie.internetdb_score([], [], ["compromised"]), 80)
+        self.assertEqual(ie.internetdb_score([23], [], ["malware", "tor"]), 80)
+
+    def test_cve_score(self):
+        self.assertEqual(ie.cve_score(5.0, False, None), 50)
+        self.assertEqual(ie.cve_score(5.0, True, None), 90)
+        self.assertEqual(ie.cve_score(9.8, False, 0.6), 100)
+        self.assertEqual(ie.cve_score(7.5, False, 0.5), 85)
+        self.assertEqual(ie.cve_score(None, False, None), 0)
+
+    def test_verdict_bands(self):
+        for s, v in [(None, "Unknown"), (0, "Clean"), (9, "Clean"), (10, "Low"), (39, "Low"),
+                     (40, "Medium"), (69, "Medium"), (70, "High"), (89, "High"),
+                     (90, "Critical"), (100, "Critical")]:
+            self.assertEqual(ie.verdict_for(s), v)
+
+    def test_score_ioc_max_and_reason(self):
+        score, verdict, reason = ie.score_ioc([self._src("virustotal", "ok", 28, "VT 1/90 engines"),
+                                               self._src("abuseipdb", "ok", 87, "AbuseIPDB 87%")])
+        self.assertEqual((score, verdict), (87, "High"))
+        self.assertEqual(reason, "VT 1/90 engines · AbuseIPDB 87%")
+
+    def test_score_ioc_unknown_without_ok(self):
+        self.assertEqual(ie.score_ioc([self._src("virustotal", "not_found", None),
+                                       self._src("abuseipdb", "error", None)])[:2], (None, "Unknown"))
+
+    def test_overall(self):
+        self.assertEqual(ie.overall_verdict([{"score": None}, {"score": 45}, {"score": 12}]), (45, "Medium"))
+        self.assertEqual(ie.overall_verdict([{"score": None}]), (None, "Unknown"))
+        self.assertEqual(ie.overall_verdict([]), (None, "Unknown"))
+
+
 if __name__ == "__main__":
     unittest.main()
