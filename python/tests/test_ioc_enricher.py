@@ -201,5 +201,101 @@ class TestHttpAndCache(unittest.TestCase):
                 ie.fetch_json("http://x")
 
 
+def fake(*responses):
+    """Fake fetch_json returning the given (status, json, headers) tuples in order."""
+    it = iter(responses)
+    return lambda url, headers=None, timeout=15: next(it)
+
+
+class TestSources(unittest.TestCase):
+    def test_vt_ok(self):
+        body = {"data": {"attributes": {"last_analysis_stats":
+                {"malicious": 5, "suspicious": 0, "harmless": 60, "undetected": 25}}}}
+        r = ie.lookup_virustotal({"type": "hash", "value": "a" * 32}, "k", http=fake((200, body, {})))
+        self.assertEqual((r["status"], r["score"], r["reason"]), ("ok", 60, "VT 5/90 engines"))
+        self.assertEqual(r["link"], "https://www.virustotal.com/gui/file/" + "a" * 32)
+        self.assertEqual(r["data"]["total"], 90)
+
+    def test_vt_sends_api_key_and_ip_endpoint(self):
+        seen = []
+
+        def http(url, headers=None, timeout=15):
+            seen.append((url, headers))
+            return (404, None, {})
+        ie.lookup_virustotal({"type": "ip", "value": "8.8.8.8"}, "KEY", http=http)
+        self.assertEqual(seen[0], ("https://www.virustotal.com/api/v3/ip_addresses/8.8.8.8", {"x-apikey": "KEY"}))
+
+    def test_vt_url_id_is_base64url(self):
+        seen = []
+
+        def http(url, headers=None, timeout=15):
+            seen.append(url)
+            return (404, None, {})
+        ie.lookup_virustotal({"type": "url", "value": "http://evil.com/a"}, "k", http=http)
+        self.assertTrue(seen[0].endswith("/urls/aHR0cDovL2V2aWwuY29tL2E"))
+
+    def test_not_found(self):
+        r = ie.lookup_virustotal({"type": "domain", "value": "x.com"}, "k", http=fake((404, None, {})))
+        self.assertEqual((r["status"], r["score"]), ("not_found", None))
+
+    def test_auth_error_raises(self):
+        with self.assertRaises(ie.AuthError):
+            ie.lookup_abuseipdb({"type": "ip", "value": "8.8.8.8"}, "bad", http=fake((401, None, {})))
+
+    def test_429_retries_once_with_retry_after(self):
+        sleeps = []
+        body = {"data": {"abuseConfidenceScore": 87, "totalReports": 312, "countryCode": "NL",
+                         "isp": "X", "usageType": "Data Center"}}
+        r = ie.lookup_abuseipdb({"type": "ip", "value": "8.8.8.8"}, "k",
+                                http=fake((429, None, {"Retry-After": "2"}), (200, body, {})),
+                                sleep=sleeps.append)
+        self.assertEqual(sleeps, [2])
+        self.assertEqual((r["score"], r["reason"]), (87, "AbuseIPDB 87% (312 reports)"))
+        self.assertEqual(r["data"]["usageType"], "Data Center")
+
+    def test_429_default_backoff_vt(self):
+        sleeps = []
+        ie.lookup_virustotal({"type": "hash", "value": "a" * 32}, "k",
+                             http=fake((429, None, {}), (404, None, {})), sleep=sleeps.append)
+        self.assertEqual(sleeps, [60])
+
+    def test_429_twice_is_error(self):
+        sleeps = []
+        r = ie.lookup_internetdb({"type": "ip", "value": "8.8.8.8"},
+                                 http=fake((429, None, {}), (429, None, {})), sleep=sleeps.append)
+        self.assertEqual(r["status"], "error")
+        self.assertEqual(r["reason"], "rate limited")
+        self.assertEqual(sleeps, [5])
+
+    def test_network_error(self):
+        def boom(*a, **k):
+            raise ie.FetchError("timed out")
+        r = ie.lookup_cvedb({"type": "cve", "value": "CVE-2021-44228"}, http=boom)
+        self.assertEqual(r["status"], "error")
+        self.assertIn("timed out", r["reason"])
+
+    def test_internetdb_ok(self):
+        body = {"ports": [23, 443], "vulns": ["CVE-2020-1"], "tags": [], "hostnames": []}
+        r = ie.lookup_internetdb({"type": "ip", "value": "8.8.8.8"}, http=fake((200, body, {})))
+        self.assertEqual((r["score"], r["reason"]), (20, "Shodan: 2 ports, 1 CVEs"))
+        self.assertEqual(r["link"], "https://www.shodan.io/host/8.8.8.8")
+
+    def test_internetdb_tags_in_reason(self):
+        body = {"ports": [], "vulns": [], "tags": ["tor", "vpn"], "hostnames": []}
+        r = ie.lookup_internetdb({"type": "ip", "value": "8.8.8.8"}, http=fake((200, body, {})))
+        self.assertEqual(r["reason"], "Shodan: 0 ports, 0 CVEs, tags: tor,vpn")
+
+    def test_cvedb_kev(self):
+        body = {"cvss_v3": 10.0, "epss": 0.97, "kev": True, "summary": "Log4Shell"}
+        r = ie.lookup_cvedb({"type": "cve", "value": "CVE-2021-44228"}, http=fake((200, body, {})))
+        self.assertEqual((r["score"], r["reason"]), (100, "CVSS 10.0, KEV, EPSS 0.97"))
+        self.assertEqual(r["link"], "https://nvd.nist.gov/vuln/detail/CVE-2021-44228")
+
+    def test_cvedb_falls_back_to_cvss(self):
+        body = {"cvss_v3": None, "cvss": 5.0, "kev": False, "summary": "x"}
+        r = ie.lookup_cvedb({"type": "cve", "value": "CVE-2000-0001"}, http=fake((200, body, {})))
+        self.assertEqual((r["score"], r["reason"]), (50, "CVSS 5.0"))
+
+
 if __name__ == "__main__":
     unittest.main()

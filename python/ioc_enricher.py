@@ -9,6 +9,8 @@ and Shodan CVEDB) and writes a scored, explainable report.
 Standard library only. API keys are read from the VT_API_KEY and
 ABUSEIPDB_API_KEY environment variables; sources without a key are skipped.
 """
+import base64
+import hashlib
 import ipaddress
 import json
 import re
@@ -285,3 +287,131 @@ class Cache:
             self.path.write_text(json.dumps(self.entries))
         except OSError:
             pass  # a cache we can't write is not worth failing the run over
+
+
+# ---------------------------------------------------------------------------
+# Threat intelligence sources
+# ---------------------------------------------------------------------------
+
+SOURCES_FOR_TYPE = {
+    "ip": ["virustotal", "abuseipdb", "internetdb"],
+    "domain": ["virustotal"],
+    "url": ["virustotal"],
+    "hash": ["virustotal"],
+    "cve": ["cvedb"],
+}
+SOURCE_LABELS = {"virustotal": "VT", "abuseipdb": "AbuseIPDB", "internetdb": "Shodan", "cvedb": "CVEDB"}
+DEFAULT_BACKOFF = {"virustotal": 60}  # seconds to wait after a 429 without Retry-After
+OTHER_BACKOFF = 5
+
+_VT_API = {"ip": "ip_addresses", "domain": "domains", "url": "urls", "hash": "files"}
+_VT_GUI = {"ip": "ip-address", "domain": "domain", "url": "url", "hash": "file"}
+
+
+class AuthError(Exception):
+    """A source rejected our API key (401/403). The orchestrator disables it."""
+
+
+def _result(source, status, score=None, reason="", data=None, link=""):
+    return {"source": source, "status": status, "score": score, "reason": reason,
+            "data": data or {}, "link": link}
+
+
+def _request(source, url, headers, http, sleep):
+    """
+    Shared status handling. Returns (status, json, error_message):
+    200 -> ok, 404 -> not_found, 401/403 -> AuthError, 429 -> wait and retry once.
+    """
+    for attempt in range(2):
+        try:
+            code, body, resp_headers = http(url, headers=headers)
+        except FetchError as err:
+            return "error", None, str(err)
+        if code == 200:
+            return "ok", body, ""
+        if code == 404:
+            return "not_found", None, ""
+        if code in (401, 403):
+            raise AuthError(source)
+        if code == 429:
+            if attempt == 0:
+                try:
+                    wait = int(resp_headers.get("Retry-After"))
+                except (TypeError, ValueError):
+                    wait = DEFAULT_BACKOFF.get(source, OTHER_BACKOFF)
+                sleep(wait)
+                continue
+            return "error", None, "rate limited"
+        return "error", None, f"HTTP {code}"
+    return "error", None, "rate limited"
+
+
+def _non_ok(source, status, message, link):
+    if status == "not_found":
+        return _result(source, "not_found", reason=f"{SOURCE_LABELS[source]}: not found", link=link)
+    return _result(source, "error", reason=message, link=link)
+
+
+def lookup_virustotal(ioc, api_key, http=fetch_json, sleep=time.sleep):
+    value = ioc["value"]
+    if ioc["type"] == "url":
+        vt_id = base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
+        gui_id = hashlib.sha256(value.encode()).hexdigest()  # the VT web UI uses the URL's SHA-256
+    else:
+        vt_id = gui_id = value
+    url = f"https://www.virustotal.com/api/v3/{_VT_API[ioc['type']]}/{vt_id}"
+    link = f"https://www.virustotal.com/gui/{_VT_GUI[ioc['type']]}/{gui_id}"
+    status, body, message = _request("virustotal", url, {"x-apikey": api_key}, http, sleep)
+    if status != "ok":
+        return _non_ok("virustotal", status, message, link)
+    stats = (body.get("data") or {}).get("attributes", {}).get("last_analysis_stats", {})
+    data = {k: int(stats.get(k, 0)) for k in ("malicious", "suspicious", "harmless", "undetected")}
+    data["total"] = sum(data.values())
+    return _result("virustotal", "ok", vt_score(data["malicious"], data["suspicious"]),
+                   f"VT {data['malicious']}/{data['total']} engines", data, link)
+
+
+def lookup_abuseipdb(ioc, api_key, http=fetch_json, sleep=time.sleep):
+    ip = ioc["value"]
+    url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90"
+    link = f"https://www.abuseipdb.com/check/{ip}"
+    headers = {"Key": api_key, "Accept": "application/json"}
+    status, body, message = _request("abuseipdb", url, headers, http, sleep)
+    if status != "ok":
+        return _non_ok("abuseipdb", status, message, link)
+    raw = body.get("data") or {}
+    data = {k: raw.get(k) for k in ("abuseConfidenceScore", "totalReports", "countryCode", "isp", "usageType")}
+    score = int(data["abuseConfidenceScore"] or 0)
+    return _result("abuseipdb", "ok", score,
+                   f"AbuseIPDB {score}% ({data['totalReports'] or 0} reports)", data, link)
+
+
+def lookup_internetdb(ioc, http=fetch_json, sleep=time.sleep):
+    ip = ioc["value"]
+    link = f"https://www.shodan.io/host/{ip}"
+    status, body, message = _request("internetdb", f"https://internetdb.shodan.io/{ip}", None, http, sleep)
+    if status != "ok":
+        return _non_ok("internetdb", status, message, link)
+    data = {k: body.get(k) or [] for k in ("ports", "vulns", "tags", "hostnames")}
+    reason = f"Shodan: {len(data['ports'])} ports, {len(data['vulns'])} CVEs"
+    if data["tags"]:
+        reason += ", tags: " + ",".join(data["tags"])
+    return _result("internetdb", "ok", internetdb_score(data["ports"], data["vulns"], data["tags"]),
+                   reason, data, link)
+
+
+def lookup_cvedb(ioc, http=fetch_json, sleep=time.sleep):
+    cve = ioc["value"]
+    link = f"https://nvd.nist.gov/vuln/detail/{cve}"
+    status, body, message = _request("cvedb", f"https://cvedb.shodan.io/cve/{cve}", None, http, sleep)
+    if status != "ok":
+        return _non_ok("cvedb", status, message, link)
+    cvss = body.get("cvss_v3") if body.get("cvss_v3") is not None else body.get("cvss")
+    data = {"cvss": cvss, "epss": body.get("epss"), "kev": bool(body.get("kev")),
+            "summary": (body.get("summary") or "")[:200]}
+    reason = f"CVSS {cvss if cvss is not None else 'n/a'}"
+    if data["kev"]:
+        reason += ", KEV"
+    if data["epss"] is not None:
+        reason += f", EPSS {data['epss']:.2f}"
+    return _result("cvedb", "ok", cve_score(cvss, data["kev"], data["epss"]), reason, data, link)
