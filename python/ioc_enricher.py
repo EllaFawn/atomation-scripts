@@ -16,6 +16,7 @@ import json
 import re
 import threading
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
@@ -519,3 +520,164 @@ def enrich(iocs, keys, cache, vt_rate=4, lookups=None, sleep=time.sleep, clock=t
         score, verdict, reason = score_ioc(sources)
         enriched.append({**ioc, "score": score, "verdict": verdict, "reason": reason, "sources": sources})
     return enriched
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+ANSI = {"Critical": "\x1b[31m", "High": "\x1b[31m", "Medium": "\x1b[33m", "Low": "\x1b[32m",
+        "Clean": "\x1b[32m", "Unknown": "\x1b[90m", "Not checked": "\x1b[90m"}
+ANSI_RESET = "\x1b[0m"
+DASH = "\u2013"
+
+
+def _defang_host(host):
+    if ":" in host and _valid_ip(host.strip("[]")):
+        return host.replace(":", "[:]")
+    dot = host.rfind(".")
+    return host if dot == -1 else host[:dot] + "[.]" + host[dot + 1:]
+
+
+def defang(value):
+    """Make an indicator non-clickable: hxxp scheme, last dot of host -> [.], IPv6 : -> [:]."""
+    match = re.match(r"(?i)http(s?://)([^/?#]*)(.*)", value)
+    if match:
+        return "hxxp" + match.group(1) + _defang_host(match.group(2)) + match.group(3)
+    return _defang_host(value)
+
+
+def exit_code(verdict):
+    return {"Medium": 1, "High": 2, "Critical": 2}.get(verdict, 0)
+
+
+def build_results(source_name, text, iocs, skipped, offline):
+    """Assemble the single results dict that all three outputs are rendered from."""
+    ordered = sorted(iocs, key=lambda i: (i["score"] is None, -(i["score"] or 0)))
+    if offline:
+        overall = {"score": None, "verdict": "Not checked"}
+    else:
+        score, verdict = overall_verdict(iocs)
+        overall = {"score": score, "verdict": verdict}
+    errors = [{"ioc": defang(i["value"]), "source": s["source"], "reason": s["reason"]}
+              for i in ordered for s in i["sources"] if s["status"] == "error"]
+    return {
+        "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "input": {"source": source_name, "sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()},
+        "offline": offline,
+        "overall": overall,
+        "counts": {"found": len(iocs) + len(skipped), "enriched": len(iocs), "skipped": len(skipped)},
+        "iocs": [{**i, "defanged": defang(i["value"])} for i in ordered],
+        "skipped": [{**s, "defanged": defang(s["value"])} for s in skipped],
+        "errors": errors,
+    }
+
+
+def _fmt_score(score):
+    return DASH if score is None else str(score)
+
+
+def _cell(text):
+    return str(text).replace("|", "\\|")
+
+
+def _fmt_data(data):
+    parts = []
+    for key, val in data.items():
+        if val in (None, "", []):
+            continue
+        parts.append(f"{key}: {', '.join(map(str, val)) if isinstance(val, list) else val}")
+    return "; ".join(parts)
+
+
+def render_markdown(results):
+    overall = results["overall"]
+    score = f" ({overall['score']}/100)" if overall["score"] is not None else ""
+    lines = [
+        "# IoC Enrichment Report", "",
+        f"- **Generated:** {results['generated']}",
+        f"- **Input:** {results['input']['source']}",
+        f"- **Input SHA-256:** `{results['input']['sha256']}`",
+        f"- **Overall: {overall['verdict']}{score}**", "",
+        "## Summary", "",
+        "| Type | Indicator | Verdict | Score | Reason |",
+        "|---|---|---|---|---|",
+    ]
+    for ioc in results["iocs"]:
+        lines.append(f"| {ioc['type']} | {_cell(ioc['defanged'])} | {ioc['verdict']} | "
+                     f"{_fmt_score(ioc['score'])} | {_cell(ioc['reason'])} |")
+    if not results["iocs"]:
+        lines.append("| | No indicators found | | | |")
+
+    lines += ["", "## Details", ""]
+    for ioc in results["iocs"]:
+        lines += [f"### {ioc['defanged']}", "", f"Type: {ioc['type']} · Verdict: {ioc['verdict']} · "
+                  f"Score: {_fmt_score(ioc['score'])}", ""]
+        for src in ioc["sources"]:
+            line = f"- **{SOURCE_LABELS.get(src['source'], src['source'])}** ({src['status']}): {src['reason']}"
+            details = _fmt_data(src["data"])
+            if details:
+                line += f" — {details}"
+            if src["link"]:
+                line += f" — [link]({src['link']})"
+            lines.append(line)
+        if not ioc["sources"]:
+            lines.append("- Not checked (offline mode)")
+        lines.append("")
+
+    counts = results["counts"]
+    lines += ["## Coverage", "",
+              f"- Found: {counts['found']} · Enriched: {counts['enriched']} · Skipped: {counts['skipped']}", ""]
+    if results["skipped"]:
+        lines += ["**Skipped:**", ""]
+        lines += [f"- `{s['defanged']}` ({s['type']}) — {s['reason']}" for s in results["skipped"]]
+        lines.append("")
+    if results["errors"]:
+        lines += ["**Lookup errors:**", ""]
+        lines += [f"- `{e['ioc']}` — {SOURCE_LABELS.get(e['source'], e['source'])}: {e['reason']}"
+                  for e in results["errors"]]
+        lines.append("")
+    unknown = sum(1 for i in results["iocs"] if i["verdict"] == "Unknown")
+    if unknown:
+        lines += [f"> **{unknown} indicator(s) returned no data — verdict Unknown, not Clean.**", ""]
+    return "\n".join(lines)
+
+
+def render_terminal(results, color):
+    def paint(verdict, text):
+        return f"{ANSI.get(verdict, '')}{text}{ANSI_RESET}" if color else text
+
+    overall = results["overall"]
+    score = f" ({overall['score']}/100)" if overall["score"] is not None else ""
+    out = [paint(overall["verdict"], f"Overall: {overall['verdict']}{score}"), ""]
+    rows = [(i["type"], i["defanged"][:60], i["verdict"], _fmt_score(i["score"]), i["reason"])
+            for i in results["iocs"]]
+    if rows:
+        header = ("TYPE", "INDICATOR", "VERDICT", "SCORE", "REASON")
+        widths = [max(len(r[c]) for r in rows + [header]) for c in range(4)]
+        out.append("  ".join(h.ljust(w) for h, w in zip(header, widths)) + "  REASON")
+        for row in rows:
+            cells = [row[c].ljust(widths[c]) for c in range(4)]
+            cells[2] = paint(row[2], cells[2])
+            out.append("  ".join(cells) + "  " + row[4])
+    else:
+        out.append("No indicators found.")
+    counts = results["counts"]
+    out += ["", f"Found {counts['found']} · enriched {counts['enriched']} · skipped {counts['skipped']}"
+                f" · lookup errors {len(results['errors'])}"]
+    return "\n".join(out)
+
+
+def write_reports(results, outdir, md, js):
+    """Write ioc_report_<timestamp>.md / .json into outdir; return the paths written."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    paths = []
+    if md:
+        path = Path(outdir) / f"ioc_report_{stamp}.md"
+        path.write_text(render_markdown(results) + "\n", encoding="utf-8")
+        paths.append(path)
+    if js:
+        path = Path(outdir) / f"ioc_report_{stamp}.json"
+        path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        paths.append(path)
+    return paths

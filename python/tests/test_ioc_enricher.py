@@ -374,5 +374,76 @@ class TestEnrich(unittest.TestCase):
         self.assertIn("3 VirusTotal lookups, ~0.5 min at 4/min", logs)
 
 
+class TestReporting(unittest.TestCase):
+    def _results(self):
+        iocs = [
+            {"type": "domain", "value": "x.com", "score": None, "verdict": "Unknown",
+             "reason": "No source returned data",
+             "sources": [{"source": "virustotal", "status": "error", "score": None, "reason": "timed out",
+                          "data": {}, "link": ""}]},
+            {"type": "ip", "value": "8.8.8.8", "score": 87, "verdict": "High", "reason": "AbuseIPDB 87%",
+             "sources": [{"source": "abuseipdb", "status": "ok", "score": 87, "reason": "AbuseIPDB 87%",
+                          "data": {"isp": "X"}, "link": "L"}]},
+        ]
+        skipped = [{"type": "ip", "value": "10.0.0.1", "reason": "non-routable"}]
+        return ie.build_results("email.txt", "hello", iocs, skipped, False)
+
+    def test_defang(self):
+        self.assertEqual(ie.defang("http://evil.com/a.php"), "hxxp://evil[.]com/a.php")
+        self.assertEqual(ie.defang("https://sub.evil.com"), "hxxps://sub.evil[.]com")
+        self.assertEqual(ie.defang("1.2.3.4"), "1.2.3[.]4")
+        self.assertEqual(ie.defang("evil.com"), "evil[.]com")
+        self.assertEqual(ie.defang("2606:4700::1"), "2606[:]4700[:][:]1")
+        self.assertEqual(ie.defang("CVE-2021-44228"), "CVE-2021-44228")
+        self.assertEqual(ie.defang("a" * 32), "a" * 32)
+
+    def test_exit_codes(self):
+        for v, c in [("Clean", 0), ("Low", 0), ("Unknown", 0), ("Medium", 1), ("High", 2), ("Critical", 2)]:
+            self.assertEqual(ie.exit_code(v), c)
+
+    def test_build_results(self):
+        r = self._results()
+        self.assertEqual(r["overall"], {"score": 87, "verdict": "High"})
+        self.assertEqual(r["counts"], {"found": 3, "enriched": 2, "skipped": 1})
+        self.assertEqual(r["input"], {"source": "email.txt", "sha256": hashlib.sha256(b"hello").hexdigest()})
+        self.assertEqual(r["errors"], [{"ioc": "x[.]com", "source": "virustotal", "reason": "timed out"}])
+        self.assertEqual([i["value"] for i in r["iocs"]], ["8.8.8.8", "x.com"])  # sorted, None last
+        self.assertEqual(r["iocs"][0]["defanged"], "8.8.8[.]8")
+        json.dumps(r)
+
+    def test_markdown_defanged_and_coverage(self):
+        md = ie.render_markdown(self._results())
+        self.assertIn("# IoC Enrichment Report", md)
+        self.assertIn("**Overall: High (87/100)**", md)
+        self.assertIn("| ip | 8.8.8[.]8 | High | 87 | AbuseIPDB 87% |", md)
+        self.assertIn("| domain | x[.]com | Unknown | – | No source returned data |", md)
+        self.assertNotIn("8.8.8.8", md)
+        self.assertIn("10.0.0[.]1", md)
+        self.assertIn("1 indicator(s) returned no data", md)
+        for heading in ("## Summary", "## Details", "## Coverage", "### 8.8.8[.]8"):
+            self.assertIn(heading, md)
+
+    def test_markdown_offline(self):
+        r = ie.build_results("stdin", "x", [{"type": "ip", "value": "8.8.8.8", "score": None,
+                                              "verdict": "Not checked", "reason": "", "sources": []}], [], True)
+        md = ie.render_markdown(r)
+        self.assertIn("| ip | 8.8.8[.]8 | Not checked | – |", md)
+        self.assertNotIn("returned no data", md)
+
+    def test_terminal_color_toggle(self):
+        plain = ie.render_terminal(self._results(), color=False)
+        self.assertNotIn("\x1b[", plain)
+        self.assertIn("8.8.8[.]8", plain)
+        self.assertIn("\x1b[", ie.render_terminal(self._results(), color=True))
+
+    def test_write_reports(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = ie.write_reports(self._results(), Path(d), md=True, js=True)
+            self.assertEqual(sorted(p.suffix for p in paths), [".json", ".md"])
+            self.assertTrue(all(p.name.startswith("ioc_report_") for p in paths))
+            self.assertEqual(json.loads(paths[-1].read_text() if paths[-1].suffix == ".json"
+                                        else paths[0].read_text())["overall"]["verdict"], "High")
+
+
 if __name__ == "__main__":
     unittest.main()
