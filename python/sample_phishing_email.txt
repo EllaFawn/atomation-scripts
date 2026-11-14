@@ -1,0 +1,28 @@
+Received: from mail-relay.secure-login-verify[.]xyz (192.0.2.15) by mx01.corp.local (10.1.2.3)
+From: "IT Support" <it-support[@]secure-login-verify[.]xyz>
+To: j.smith@corp.local
+Subject: ACTION REQUIRED: Your Microsoft 365 password expires today
+Date: Thu, 12 Nov 2026 08:14:22 +0000
+
+Dear user,
+
+Our records show that your Microsoft 365 password expires today. To avoid
+losing access to email and Teams, please verify your account within 2 hours:
+
+    hxxp://secure-login-verify[.]xyz/reset.php?user=j.smith
+
+If the link above does not work, use our backup portal at
+account-update-portal[.]top or sign in normally at https://login.microsoft.com/
+and you will be redirected.
+
+Please review the attached invoice.pdf for the outstanding licence fee.
+Attachment hashes (for your antivirus):
+  MD5:    44d88612fea8a8f36de82e1278abb02f
+  SHA256: 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+
+If you have connection problems, set your DNS to 8.8.8.8 or 1.1.1.1.
+
+This update also includes the security patch for CVE-2021-44228.
+
+Regards,
+IT Support Team

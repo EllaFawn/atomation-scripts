@@ -9,11 +9,14 @@ and Shodan CVEDB) and writes a scored, explainable report.
 Standard library only. API keys are read from the VT_API_KEY and
 ABUSEIPDB_API_KEY environment variables; sources without a key are skipped.
 """
+import argparse
 import base64
 import hashlib
 import ipaddress
 import json
+import os
 import re
+import sys
 import threading
 import time
 from datetime import datetime
@@ -41,6 +44,11 @@ FILE_EXTENSIONS = {
     "ps1", "sh", "py", "msi", "iso", "img", "php", "asp", "aspx", "jsp",
 }
 
+# Internal / reserved names that never resolve on the public internet.
+INTERNAL_TLDS = {"local", "lan", "internal", "corp", "home", "localdomain", "localhost",
+                 "test", "invalid", "example", "intranet", "private"}
+RESERVED_DOMAINS = {"example.com", "example.net", "example.org"}
+
 IOC_TYPES = ("ip", "domain", "url", "hash", "cve")
 
 _REFANG_RULES = [
@@ -52,10 +60,10 @@ _REFANG_RULES = [
 
 _URL_RE = re.compile(r"https?://[^\s<>\"'\]]+", re.IGNORECASE)
 _URL_TRAILING = ".,;:!?)'\""
-_IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)")
 _IPV6_RE = re.compile(r"(?<![0-9A-Fa-f:])[0-9A-Fa-f:]{2,}(?![0-9A-Fa-f:])")
 _DOMAIN_RE = re.compile(
-    r"(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?![\w-])",
+    r"(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?![\w@-])",
     re.IGNORECASE,
 )
 # Exactly 64 (SHA-256), 40 (SHA-1) or 32 (MD5) hex chars, not part of a longer hex run.
@@ -76,6 +84,13 @@ def is_allowlisted(domain):
     """True if domain is in ALLOWLIST or is a subdomain of an allowlisted domain."""
     domain = domain.lower().rstrip(".")
     return any(domain == a or domain.endswith("." + a) for a in ALLOWLIST)
+
+
+def is_internal_domain(domain):
+    """True for internal TLDs (corp.local) and the reserved example.* domains."""
+    domain = domain.lower().rstrip(".")
+    return (domain.rsplit(".", 1)[-1] in INTERNAL_TLDS
+            or any(domain == r or domain.endswith("." + r) for r in RESERVED_DOMAINS))
 
 
 def _valid_ip(candidate):
@@ -139,6 +154,10 @@ def extract_iocs(text):
         for value in found[ioc_type]:
             reason = None
             if ioc_type == "ip" and not ipaddress.ip_address(value).is_global:
+                reason = "non-routable"
+            elif ioc_type == "domain" and is_internal_domain(value):
+                reason = "non-routable"
+            elif ioc_type == "url" and is_internal_domain(urlsplit(value).hostname or ""):
                 reason = "non-routable"
             elif ioc_type == "domain" and is_allowlisted(value):
                 reason = "allowlisted"
@@ -650,7 +669,7 @@ def render_terminal(results, color):
     overall = results["overall"]
     score = f" ({overall['score']}/100)" if overall["score"] is not None else ""
     out = [paint(overall["verdict"], f"Overall: {overall['verdict']}{score}"), ""]
-    rows = [(i["type"], i["defanged"][:60], i["verdict"], _fmt_score(i["score"]), i["reason"])
+    rows = [(i["type"], i["defanged"][:80], i["verdict"], _fmt_score(i["score"]), i["reason"])
             for i in results["iocs"]]
     if rows:
         header = ("TYPE", "INDICATOR", "VERDICT", "SCORE", "REASON")
@@ -681,3 +700,52 @@ def write_reports(results, outdir, md, js):
         path.write_text(json.dumps(results, indent=2), encoding="utf-8")
         paths.append(path)
     return paths
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Extract IoCs from text, enrich them with threat intel and write a scored report.")
+    parser.add_argument("input", nargs="?", help="file to analyse (reads stdin if omitted)")
+    parser.add_argument("--json", action="store_true", help="also write a JSON report")
+    parser.add_argument("--no-md", action="store_true", help="do not write the Markdown report")
+    parser.add_argument("--offline", action="store_true", help="extract only, no API calls")
+    parser.add_argument("--no-cache", action="store_true", help="do not read or write the result cache")
+    parser.add_argument("--vt-rate", type=float, default=4, help="VirusTotal requests per minute (default 4)")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.input:
+        try:
+            text = Path(args.input).read_bytes().decode("utf-8", errors="replace")
+        except OSError as err:
+            print(f"Error: cannot read {args.input}: {err.strerror or err}", file=sys.stderr)
+            return 3
+        source_name = args.input
+    else:
+        text, source_name = sys.stdin.read(), "stdin"
+
+    extracted = extract_iocs(text)
+    if args.offline:
+        iocs = [{**i, "score": None, "verdict": "Not checked", "reason": "", "sources": []}
+                for i in extracted["iocs"]]
+    else:
+        keys = {source: os.environ.get(var) for source, var in KEY_ENV_VARS.items()}
+        cache = Cache(DEFAULT_CACHE_PATH, enabled=not args.no_cache)
+        iocs = enrich(extracted["iocs"], keys, cache, vt_rate=args.vt_rate)
+        cache.save()
+
+    results = build_results(source_name, text, iocs, extracted["skipped"], args.offline)
+    print(render_terminal(results, color=sys.stdout.isatty()))
+    for path in write_reports(results, Path.cwd(), md=not args.no_md, js=args.json):
+        print(f"Report written: {path}")
+    return 0 if args.offline else exit_code(results["overall"]["verdict"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

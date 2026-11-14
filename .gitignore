@@ -11,3 +11,5 @@ failed_counts.txt
 bruteforce_incidents.txt
 summary_report.txt
 top_attackers.png
+ioc_report_*.md
+ioc_report_*.json

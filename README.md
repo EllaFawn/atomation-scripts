@@ -1,7 +1,8 @@
 # Automation Scripts
 
 A small collection of Bash and Python scripts for everyday network and security tasks:
-sweeping and pinging hosts, hashing data, and analysing SSH auth logs for failed and brute-force logins.
+sweeping and pinging hosts, hashing data, analysing SSH auth logs for failed and brute-force logins,
+and enriching Indicators of Compromise with threat intelligence.
 
 ---
 
@@ -16,7 +17,11 @@ sweeping and pinging hosts, hashing data, and analysing SSH auth logs for failed
 └── python/
     ├── brute_force_detector.py
     ├── failed_login_counter.py
-    └── sample_auth_small.log
+    ├── ioc_enricher.py
+    ├── sample_auth_small.log
+    ├── sample_phishing_email.txt
+    └── tests/
+        └── test_ioc_enricher.py
 ```
 
 ## Bash
@@ -54,7 +59,7 @@ Requires `python3`.
 
 ## Python
 
-Both Python scripts read `sample_auth_small.log` (an example SSH auth log) from the `python/` folder and can be run from any directory. Report files are written to the current directory.
+The two log analysis scripts read `sample_auth_small.log` (an example SSH auth log) from the `python/` folder and can be run from any directory. Report files are written to the current directory.
 
 ```bash
 python3 python/failed_login_counter.py
@@ -91,3 +96,64 @@ Functions:
 | `save_incidents_to_file(incidents, filename)` | Writes the incident report. |
 | `create_summary_report(per_ip_timestamps, filename)` | Writes the summary report. |
 | `plot_attackers_chart(per_ip_timestamps, top_n=10)` | Plots the top `n` attacking IPs. |
+
+### `ioc_enricher.py`
+
+Pulls Indicators of Compromise out of raw text (a phishing email, ticket description or log dump), looks them up in threat intelligence sources, and writes a scored report you can paste into a ticket. Defanged input (`hxxp://evil[.]com`, `1.2.3[.]4`) is handled, and indicators in the reports are defanged so they can't be clicked by accident.
+
+```bash
+python3 python/ioc_enricher.py python/sample_phishing_email.txt    # read a file
+pbpaste | python3 python/ioc_enricher.py                           # read stdin (paste a ticket)
+python3 python/ioc_enricher.py suspicious.txt --json               # also write a JSON report
+python3 python/ioc_enricher.py suspicious.txt --offline            # extract only, no API calls
+```
+
+| Option | Meaning |
+|---|---|
+| `--json` | Also write `ioc_report_<timestamp>.json`. |
+| `--no-md` | Don't write the Markdown report. |
+| `--offline` | Extract and filter only; no network calls. |
+| `--no-cache` | Don't read or write the result cache (`~/.cache/ioc_enricher/cache.json`, 24 h). |
+| `--vt-rate N` | VirusTotal requests per minute (default 4, the free-tier limit). |
+
+**What it extracts:** IPv4/IPv6 addresses, domains, URLs, MD5/SHA-1/SHA-256 hashes and CVE IDs. Private, reserved and documentation IPs, internal names (`.local`, `.corp`, ...) and a small allowlist of well-known domains are listed as skipped rather than looked up. Filenames like `invoice.pdf` are ignored.
+
+**Sources and API keys:** keys are read from environment variables. A source without a key is skipped with a warning; the Shodan sources need no key, so the script is useful even with none set.
+
+| Source | Checks | Key |
+|---|---|---|
+| [VirusTotal](https://www.virustotal.com/) | IPs, domains, URLs, hashes | `VT_API_KEY` (free account) |
+| [AbuseIPDB](https://www.abuseipdb.com/) | IPs | `ABUSEIPDB_API_KEY` (free account) |
+| [Shodan InternetDB](https://internetdb.shodan.io/) | IPs: open ports, CVEs, tags | none |
+| [Shodan CVEDB](https://cvedb.shodan.io/) | CVEs: CVSS, EPSS, CISA KEV | none |
+
+```bash
+export VT_API_KEY=...
+export ABUSEIPDB_API_KEY=...
+```
+
+**Scoring:** each source gives a 0-100 score, an indicator's score is the highest of its sources, and the overall score is the highest indicator score. Every score comes with its reason (e.g. `VT 14/94 engines · AbuseIPDB 87% (312 reports)`).
+
+| Source | Rule |
+|---|---|
+| VirusTotal | 0 detections → 0, otherwise `20 + 8 × malicious + 4 × suspicious`, max 100 |
+| AbuseIPDB | Abuse confidence score as-is |
+| Shodan InternetDB | +10 per CVE (max 40), +10 per risky open port such as Telnet/SMB/RDP/Redis (max 30), capped at 50 (exposure is not maliciousness). Tagged `compromised`/`malware` → 80, `tor` → 40 |
+| Shodan CVEDB | CVSS × 10; on CISA KEV → at least 90; EPSS ≥ 0.5 → +10 |
+
+Verdicts: **Clean** 0-9 · **Low** 10-39 · **Medium** 40-69 · **High** 70-89 · **Critical** 90-100 · **Unknown** when no source returned data (never treated as Clean).
+
+**Exit codes** (for use in scripts or SOAR playbooks):
+
+| Code | Meaning |
+|---|---|
+| 0 | Clean, Low or Unknown (always 0 with `--offline`) |
+| 1 | Medium |
+| 2 | High or Critical |
+| 3 | Could not run (e.g. unreadable input file) |
+
+**Tests** (offline, standard library only):
+
+```bash
+python3 -m unittest discover -s python/tests -v
+```

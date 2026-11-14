@@ -76,6 +76,17 @@ class TestExtraction(unittest.TestCase):
     def test_domain_from_email(self):
         self.assertIn("evil-mail.org", self._vals("from: bob[@]evil-mail[.]org", "domain"))
 
+    def test_ip_at_end_of_sentence(self):
+        self.assertEqual(self._vals("use 8.8.8.8 or 1.1.1.1.", "ip"), ["8.8.8.8", "1.1.1.1"])
+
+    def test_email_local_part_not_domain(self):
+        self.assertEqual(self._vals("To: j.smith@evil-mail.org", "domain"), ["evil-mail.org"])
+
+    def test_internal_tlds_skipped(self):
+        r = ie.extract_iocs("by mx01.corp.local and printer.lan and www.example.com")
+        self.assertEqual(r["iocs"], [])
+        self.assertEqual({s["reason"] for s in r["skipped"]}, {"non-routable"})
+
 
 class TestScoring(unittest.TestCase):
     def _src(self, name, status, score, reason="r"):
@@ -436,6 +447,12 @@ class TestReporting(unittest.TestCase):
         self.assertIn("8.8.8[.]8", plain)
         self.assertIn("\x1b[", ie.render_terminal(self._results(), color=True))
 
+    def test_terminal_shows_full_sha256(self):
+        sha = "f" * 64
+        r = ie.build_results("x", "x", [{"type": "hash", "value": sha, "score": None, "verdict": "Unknown",
+                                         "reason": "", "sources": []}], [], False)
+        self.assertIn(sha, ie.render_terminal(r, color=False))
+
     def test_write_reports(self):
         with tempfile.TemporaryDirectory() as d:
             paths = ie.write_reports(self._results(), Path(d), md=True, js=True)
@@ -443,6 +460,71 @@ class TestReporting(unittest.TestCase):
             self.assertTrue(all(p.name.startswith("ioc_report_") for p in paths))
             self.assertEqual(json.loads(paths[-1].read_text() if paths[-1].suffix == ".json"
                                         else paths[0].read_text())["overall"]["verdict"], "High")
+
+
+class TestCli(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.out = mock.patch("sys.stdout", new_callable=io.StringIO)
+        self.out.start()
+
+    def tearDown(self):
+        self.out.stop()
+        os.chdir(self.old_cwd)
+        self.tmp.cleanup()
+
+    def test_offline_sample(self):
+        sample = Path(__file__).resolve().parents[1] / "sample_phishing_email.txt"
+        code = ie.main([str(sample), "--offline", "--json"])
+        self.assertEqual(code, 0)
+        data = json.loads(next(Path.cwd().glob("ioc_report_*.json")).read_text())
+        values = {i["value"] for i in data["iocs"]}
+        self.assertTrue({"8.8.8.8", "1.1.1.1", "44d88612fea8a8f36de82e1278abb02f",
+                         "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
+                         "CVE-2021-44228"} <= values)
+        self.assertNotIn("invoice.pdf", values)
+        self.assertTrue({"192.0.2.15", "10.1.2.3"} <= {s["value"] for s in data["skipped"]})
+        self.assertTrue(list(Path.cwd().glob("ioc_report_*.md")))
+
+    def test_empty_input(self):  # Review Focus #1
+        Path("empty.txt").write_text("nothing to see here")
+        with mock.patch.object(ie, "enrich", return_value=[]):
+            self.assertEqual(ie.main(["empty.txt", "--no-cache"]), 0)
+        self.assertIn("Unknown", next(Path.cwd().glob("ioc_report_*.md")).read_text())
+
+    def test_non_utf8_input(self):  # Review Focus #2
+        Path("raw.log").write_bytes(b"\xff\xfe junk 8.8.8.8 \x80")
+        self.assertEqual(ie.main(["raw.log", "--offline", "--no-md", "--json"]), 0)
+        data = json.loads(next(Path.cwd().glob("ioc_report_*.json")).read_text())
+        self.assertEqual([i["value"] for i in data["iocs"]], ["8.8.8.8"])
+
+    def test_missing_file_returns_3(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(ie.main(["does_not_exist.txt"]), 3)
+
+    def test_stdin_input(self):
+        with mock.patch("sys.stdin", io.StringIO("CVE-2021-44228")):
+            self.assertEqual(ie.main(["--offline", "--json", "--no-md"]), 0)
+        data = json.loads(next(Path.cwd().glob("ioc_report_*.json")).read_text())
+        self.assertEqual(data["input"]["source"], "stdin")
+
+    def test_exit_code_follows_verdict(self):
+        Path("in.txt").write_text("8.8.8.8")
+        high = [{"type": "ip", "value": "8.8.8.8", "score": 95, "verdict": "Critical", "reason": "r", "sources": []}]
+        with mock.patch.object(ie, "enrich", return_value=high):
+            self.assertEqual(ie.main(["in.txt", "--no-md", "--no-cache"]), 2)
+
+    def test_keys_read_from_env(self):
+        Path("in.txt").write_text("8.8.8.8")
+        with mock.patch.dict(os.environ, {"VT_API_KEY": "v", "ABUSEIPDB_API_KEY": "a"}), \
+                mock.patch.object(ie, "enrich", return_value=[]) as enrich:
+            ie.main(["in.txt", "--no-md", "--no-cache", "--vt-rate", "500"])
+        args, kwargs = enrich.call_args
+        self.assertEqual(args[1], {"virustotal": "v", "abuseipdb": "a"})
+        self.assertEqual(kwargs["vt_rate"], 500)
+        self.assertFalse(args[2].enabled)
 
 
 if __name__ == "__main__":
