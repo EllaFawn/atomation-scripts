@@ -220,13 +220,24 @@ def verdict_for(score):
     return "Clean"
 
 
+# Sources that judge reputation. Shodan InternetDB only measures exposure, so on
+# its own it can raise an indicator's risk but never vouch for it being Clean.
+REPUTATION_SOURCES = {"virustotal", "abuseipdb", "cvedb"}
+
+
 def score_ioc(sources):
-    """Per-IoC score = highest score among sources that returned data."""
+    """
+    Per-IoC score = highest score among sources that returned data.
+    A Clean verdict needs at least one reputation source; otherwise Unknown.
+    """
     ok = [s for s in sources if s["status"] == "ok"]
     if not ok:
         return None, "Unknown", "No source returned data"
     score = max(s["score"] for s in ok)
-    return score, verdict_for(score), " · ".join(s["reason"] for s in ok)
+    reason = " · ".join(s["reason"] for s in ok)
+    if verdict_for(score) == "Clean" and not any(s["source"] in REPUTATION_SOURCES for s in ok):
+        return None, "Unknown", reason + " (no reputation data)"
+    return score, verdict_for(score), reason
 
 
 def overall_verdict(iocs):

@@ -127,6 +127,19 @@ class TestScoring(unittest.TestCase):
         self.assertEqual((score, verdict), (87, "High"))
         self.assertEqual(reason, "VT 1/90 engines · AbuseIPDB 87%")
 
+    def test_shodan_alone_cannot_mark_clean(self):
+        score, verdict, reason = ie.score_ioc([self._src("virustotal", "skipped", None),
+                                               self._src("internetdb", "ok", 0, "Shodan: 2 ports, 0 CVEs")])
+        self.assertEqual((score, verdict), (None, "Unknown"))
+        self.assertEqual(reason, "Shodan: 2 ports, 0 CVEs (no reputation data)")
+
+    def test_shodan_alone_can_raise_risk(self):
+        self.assertEqual(ie.score_ioc([self._src("internetdb", "ok", 30)])[:2], (30, "Low"))
+
+    def test_clean_with_reputation_source(self):
+        self.assertEqual(ie.score_ioc([self._src("abuseipdb", "ok", 0),
+                                       self._src("internetdb", "ok", 0)])[:2], (0, "Clean"))
+
     def test_score_ioc_unknown_without_ok(self):
         self.assertEqual(ie.score_ioc([self._src("virustotal", "not_found", None),
                                        self._src("abuseipdb", "error", None)])[:2], (None, "Unknown"))

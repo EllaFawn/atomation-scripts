@@ -141,7 +141,7 @@ export ABUSEIPDB_API_KEY=...
 | Shodan InternetDB | +10 per CVE (max 40), +10 per risky open port such as Telnet/SMB/RDP/Redis (max 30), capped at 50 (exposure is not maliciousness). Tagged `compromised`/`malware` → 80, `tor` → 40 |
 | Shodan CVEDB | CVSS × 10; on CISA KEV → at least 90; EPSS ≥ 0.5 → +10 |
 
-Verdicts: **Clean** 0-9 · **Low** 10-39 · **Medium** 40-69 · **High** 70-89 · **Critical** 90-100 · **Unknown** when no source returned data (never treated as Clean).
+Verdicts: **Clean** 0-9 · **Low** 10-39 · **Medium** 40-69 · **High** 70-89 · **Critical** 90-100 · **Unknown** when no source returned data (never treated as Clean). Shodan InternetDB only measures exposure, so it can raise an IP's score but can't mark it Clean on its own: an IP needs VirusTotal or AbuseIPDB data to be Clean.
 
 **Exit codes** (for use in scripts or SOAR playbooks):
 
