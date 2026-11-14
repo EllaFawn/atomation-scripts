@@ -297,5 +297,82 @@ class TestSources(unittest.TestCase):
         self.assertEqual((r["score"], r["reason"]), (50, "CVSS 5.0"))
 
 
+class TestEnrich(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "cache.json"
+        self.quiet = lambda *a: None
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _ok(self, name, score):
+        return lambda ioc: {"source": name, "status": "ok", "score": score, "reason": name, "data": {}, "link": ""}
+
+    def test_rate_limiter_spacing(self):
+        t, slept = [0.0], []
+
+        def sleep(s):
+            slept.append(s)
+            t[0] += s
+        rl = ie.RateLimiter(4, clock=lambda: t[0], sleep=sleep)
+        rl.wait(); rl.wait(); rl.wait()
+        self.assertEqual(slept, [15.0, 15.0])
+
+    def test_enrich_scores_and_order(self):
+        lookups = {"virustotal": self._ok("virustotal", 60), "abuseipdb": self._ok("abuseipdb", 10),
+                   "internetdb": self._ok("internetdb", 0), "cvedb": self._ok("cvedb", 90)}
+        res = ie.enrich([{"type": "ip", "value": "8.8.8.8"}, {"type": "cve", "value": "CVE-2021-44228"}],
+                        {"virustotal": "k", "abuseipdb": "k"}, ie.Cache(self.path, enabled=False),
+                        lookups=lookups, sleep=lambda s: None, log=self.quiet)
+        self.assertEqual([r["value"] for r in res], ["8.8.8.8", "CVE-2021-44228"])
+        self.assertEqual([s["source"] for s in res[0]["sources"]], ["virustotal", "abuseipdb", "internetdb"])
+        self.assertEqual((res[0]["score"], res[0]["verdict"]), (60, "Medium"))
+        self.assertEqual(res[1]["verdict"], "Critical")
+
+    def test_missing_key_skipped_and_warned_once(self):
+        logs = []
+        res = ie.enrich([{"type": "hash", "value": c * 32} for c in "ab"],
+                        {"virustotal": None, "abuseipdb": None},
+                        ie.Cache(self.path, enabled=False), lookups={}, log=logs.append)
+        self.assertEqual(res[0]["sources"][0]["status"], "skipped")
+        self.assertEqual(res[0]["sources"][0]["reason"], "No API key")
+        self.assertEqual(res[0]["verdict"], "Unknown")
+        self.assertEqual(sum("VT_API_KEY" in m for m in logs), 1)
+
+    def test_auth_error_disables_source(self):
+        calls = []
+
+        def bad(ioc):
+            calls.append(ioc)
+            raise ie.AuthError("virustotal")
+        iocs = [{"type": "hash", "value": c * 32} for c in "ab"]
+        res = ie.enrich(iocs, {"virustotal": "bad", "abuseipdb": None}, ie.Cache(self.path, enabled=False),
+                        lookups={"virustotal": bad}, sleep=lambda s: None, log=self.quiet)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([r["sources"][0]["reason"] for r in res], ["Invalid API key"] * 2)
+
+    def test_cache_hit_skips_lookup(self):
+        cache = ie.Cache(self.path)
+        cache.set("cvedb:cve:CVE-1-1", {"source": "cvedb", "status": "ok", "score": 50, "reason": "c",
+                                        "data": {}, "link": ""})
+        res = ie.enrich([{"type": "cve", "value": "CVE-1-1"}], {}, cache,
+                        lookups={"cvedb": lambda i: self.fail("should use cache")}, log=self.quiet)
+        self.assertEqual(res[0]["score"], 50)
+
+    def test_fresh_results_written_to_cache(self):
+        cache = ie.Cache(self.path)
+        ie.enrich([{"type": "cve", "value": "CVE-1-1"}], {}, cache,
+                  lookups={"cvedb": self._ok("cvedb", 70)}, log=self.quiet)
+        self.assertEqual(cache.get("cvedb:cve:CVE-1-1")["score"], 70)
+
+    def test_vt_estimate_logged(self):
+        logs = []
+        ie.enrich([{"type": "hash", "value": c * 32} for c in "abc"], {"virustotal": "k"},
+                  ie.Cache(self.path, enabled=False), lookups={"virustotal": self._ok("virustotal", 0)},
+                  sleep=lambda s: None, log=logs.append)
+        self.assertIn("3 VirusTotal lookups, ~0.5 min at 4/min", logs)
+
+
 if __name__ == "__main__":
     unittest.main()

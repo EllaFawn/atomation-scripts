@@ -14,7 +14,9 @@ import hashlib
 import ipaddress
 import json
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -415,3 +417,105 @@ def lookup_cvedb(ioc, http=fetch_json, sleep=time.sleep):
     if data["epss"] is not None:
         reason += f", EPSS {data['epss']:.2f}"
     return _result("cvedb", "ok", cve_score(cvss, data["kev"], data["epss"]), reason, data, link)
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+KEY_ENV_VARS = {"virustotal": "VT_API_KEY", "abuseipdb": "ABUSEIPDB_API_KEY"}
+
+
+class RateLimiter:
+    """Spaces calls at least 60/per_minute seconds apart. The first call never waits."""
+
+    def __init__(self, per_minute, clock=time.monotonic, sleep=time.sleep):
+        self.interval = 60.0 / per_minute
+        self.clock, self.sleep = clock, sleep
+        self.last = None
+
+    def wait(self):
+        if self.last is not None:
+            remaining = self.interval - (self.clock() - self.last)
+            if remaining > 0:
+                self.sleep(remaining)
+        self.last = self.clock()
+
+
+def _default_lookups(keys, sleep):
+    return {
+        "virustotal": lambda ioc: lookup_virustotal(ioc, keys.get("virustotal"), sleep=sleep),
+        "abuseipdb": lambda ioc: lookup_abuseipdb(ioc, keys.get("abuseipdb"), sleep=sleep),
+        "internetdb": lambda ioc: lookup_internetdb(ioc, sleep=sleep),
+        "cvedb": lambda ioc: lookup_cvedb(ioc, sleep=sleep),
+    }
+
+
+def enrich(iocs, keys, cache, vt_rate=4, lookups=None, sleep=time.sleep, clock=time.monotonic, log=print):
+    """
+    Look up every IoC in its applicable sources and score it.
+
+    VirusTotal lookups run one at a time behind a RateLimiter; other sources run
+    in a thread pool. Cached results are reused. A source whose key is missing is
+    skipped; one whose key is rejected is disabled for the rest of the run.
+    Returns IoC dicts (input order) with score, verdict, reason and sources.
+    """
+    funcs = {**_default_lookups(keys, sleep), **(lookups or {})}
+    results = {}          # (ioc index, source) -> SourceResult
+    disabled = set()
+    lock = threading.Lock()
+    vt_jobs, other_jobs = [], []
+
+    for idx, ioc in enumerate(iocs):
+        for source in SOURCES_FOR_TYPE[ioc["type"]]:
+            if source in KEY_ENV_VARS and not keys.get(source):
+                if source not in disabled:
+                    disabled.add(source)
+                    log(f"Warning: {KEY_ENV_VARS[source]} not set, skipping {SOURCE_LABELS[source]}")
+                results[idx, source] = _result(source, "skipped", reason="No API key")
+                continue
+            cached = cache.get(cache_key(source, ioc))
+            if cached is not None:
+                results[idx, source] = cached
+            elif source == "virustotal":
+                vt_jobs.append((idx, ioc, source))
+            else:
+                other_jobs.append((idx, ioc, source))
+
+    def run(job):
+        idx, ioc, source = job
+        with lock:
+            if source in disabled:
+                results[idx, source] = _result(source, "skipped", reason="Invalid API key")
+                return
+        try:
+            result = funcs[source](ioc)
+        except AuthError:
+            with lock:
+                if source not in disabled:
+                    disabled.add(source)
+                    log(f"Warning: {SOURCE_LABELS[source]} rejected the API key, disabling it")
+            result = _result(source, "skipped", reason="Invalid API key")
+        with lock:
+            results[idx, source] = result
+            cache.set(cache_key(source, ioc), result)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(run, job) for job in other_jobs]
+        if vt_jobs:
+            minutes = (len(vt_jobs) - 1) * 60 / vt_rate / 60
+            log(f"{len(vt_jobs)} VirusTotal lookups, ~{minutes:.1f} min at {vt_rate:g}/min")
+            limiter = RateLimiter(vt_rate, clock=clock, sleep=sleep)
+            for job in vt_jobs:
+                if "virustotal" not in disabled:
+                    limiter.wait()
+                run(job)
+        for future in futures:
+            future.result()
+
+    enriched = []
+    for idx, ioc in enumerate(iocs):
+        sources = [results[idx, s] for s in SOURCES_FOR_TYPE[ioc["type"]]]
+        score, verdict, reason = score_ioc(sources)
+        enriched.append({**ioc, "score": score, "verdict": verdict, "reason": reason, "sources": sources})
+    return enriched
