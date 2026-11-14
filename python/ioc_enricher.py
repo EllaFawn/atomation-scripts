@@ -58,10 +58,11 @@ _REFANG_RULES = [
     (re.compile(r"\[@\]"), "@"),
 ]
 
-_URL_RE = re.compile(r"https?://[^\s<>\"'\]]+", re.IGNORECASE)
+# Host is either a bracketed IPv6 literal or a run without brackets/slashes.
+_URL_RE = re.compile(r"https?://(?:\[[0-9A-Fa-f:.]+\]|[^\s<>\"'\[\]/]+)[^\s<>\"'\]]*", re.IGNORECASE)
 _URL_TRAILING = ".,;:!?)'\""
 _IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)")
-_IPV6_RE = re.compile(r"(?<![0-9A-Fa-f:])[0-9A-Fa-f:]{2,}(?![0-9A-Fa-f:])")
+_IPV6_RE = re.compile(r"(?<![0-9A-Fa-f:])[0-9A-Fa-f:]{2,}(?![0-9A-Fa-f:]|\.\d)")
 _DOMAIN_RE = re.compile(
     r"(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?![\w@-])",
     re.IGNORECASE,
@@ -93,6 +94,19 @@ def is_internal_domain(domain):
             or any(domain == r or domain.endswith("." + r) for r in RESERVED_DOMAINS))
 
 
+def _url_host(url):
+    """Hostname of a URL, or None if the URL can't be parsed (e.g. a broken IPv6 literal)."""
+    try:
+        return urlsplit(url).hostname
+    except ValueError:
+        return None
+
+
+def _is_non_routable(ip):
+    addr = ipaddress.ip_address(ip)
+    return not addr.is_global or addr.is_reserved or addr.is_multicast
+
+
 def _valid_ip(candidate):
     try:
         return str(ipaddress.ip_address(candidate))
@@ -121,9 +135,13 @@ def extract_iocs(text):
     for match in _URL_RE.finditer(text):
         url = match.group(0).rstrip(_URL_TRAILING)
         add("url", url)
-        host = urlsplit(url).hostname
+        host = _url_host(url)
         if host:
-            url_hosts.append(host.lower())
+            try:
+                # Punycode internationalised names (homograph domains) so they can be looked up.
+                url_hosts.append(host.lower().encode("idna").decode("ascii"))
+            except UnicodeError:
+                pass
     text_without_urls = _URL_RE.sub(" ", text)
 
     for match in _IPV4_RE.finditer(text):
@@ -153,15 +171,15 @@ def extract_iocs(text):
     for ioc_type in IOC_TYPES:
         for value in found[ioc_type]:
             reason = None
-            if ioc_type == "ip" and not ipaddress.ip_address(value).is_global:
+            if ioc_type == "ip" and _is_non_routable(value):
                 reason = "non-routable"
             elif ioc_type == "domain" and is_internal_domain(value):
                 reason = "non-routable"
-            elif ioc_type == "url" and is_internal_domain(urlsplit(value).hostname or ""):
+            elif ioc_type == "url" and is_internal_domain(_url_host(value) or ""):
                 reason = "non-routable"
             elif ioc_type == "domain" and is_allowlisted(value):
                 reason = "allowlisted"
-            elif ioc_type == "url" and is_allowlisted(urlsplit(value).hostname or ""):
+            elif ioc_type == "url" and is_allowlisted(_url_host(value) or ""):
                 reason = "allowlisted"
             if reason:
                 skipped.append({"type": ioc_type, "value": value, "reason": reason})
@@ -304,7 +322,11 @@ class Cache:
         if not self.enabled:
             return None
         entry = self.entries.get(key)
-        if not isinstance(entry, dict) or self.now() - entry.get("ts", 0) > self.ttl:
+        try:
+            expired = self.now() - float(entry["ts"]) > self.ttl
+        except (TypeError, KeyError, ValueError):
+            return None
+        if expired:
             return None
         return entry.get("result")
 
@@ -336,6 +358,7 @@ SOURCES_FOR_TYPE = {
 SOURCE_LABELS = {"virustotal": "VT", "abuseipdb": "AbuseIPDB", "internetdb": "Shodan", "cvedb": "CVEDB"}
 DEFAULT_BACKOFF = {"virustotal": 60}  # seconds to wait after a 429 without Retry-After
 OTHER_BACKOFF = 5
+MAX_BACKOFF = 120  # never wait longer than this for a single retry
 
 _VT_API = {"ip": "ip_addresses", "domain": "domains", "url": "urls", "hash": "files"}
 _VT_GUI = {"ip": "ip-address", "domain": "domain", "url": "url", "hash": "file"}
@@ -361,6 +384,8 @@ def _request(source, url, headers, http, sleep):
         except FetchError as err:
             return "error", None, str(err)
         if code == 200:
+            if not isinstance(body, dict):
+                return "error", None, "unexpected response format"
             return "ok", body, ""
         if code == 404:
             return "not_found", None, ""
@@ -369,9 +394,11 @@ def _request(source, url, headers, http, sleep):
         if code == 429:
             if attempt == 0:
                 try:
-                    wait = int(resp_headers.get("Retry-After"))
+                    wait = max(0, int(resp_headers.get("Retry-After")))
                 except (TypeError, ValueError):
                     wait = DEFAULT_BACKOFF.get(source, OTHER_BACKOFF)
+                if wait > MAX_BACKOFF:  # e.g. a daily quota reset; don't hang the run
+                    return "error", None, f"rate limited, retry after {wait} s"
                 sleep(wait)
                 continue
             return "error", None, "rate limited"
@@ -400,6 +427,8 @@ def lookup_virustotal(ioc, api_key, http=fetch_json, sleep=time.sleep):
     stats = (body.get("data") or {}).get("attributes", {}).get("last_analysis_stats", {})
     data = {k: int(stats.get(k, 0)) for k in ("malicious", "suspicious", "harmless", "undetected")}
     data["total"] = sum(data.values())
+    if data["total"] == 0:  # known to VT but never scanned: no verdict, not Clean
+        return _result("virustotal", "not_found", reason="VT: no analysis yet", link=link)
     return _result("virustotal", "ok", vt_score(data["malicious"], data["suspicious"]),
                    f"VT {data['malicious']}/{data['total']} engines", data, link)
 
@@ -493,7 +522,7 @@ def enrich(iocs, keys, cache, vt_rate=4, lookups=None, sleep=time.sleep, clock=t
     """
     funcs = {**_default_lookups(keys, sleep), **(lookups or {})}
     results = {}          # (ioc index, source) -> SourceResult
-    disabled = set()
+    disabled = {}         # source -> reason its remaining lookups are skipped
     lock = threading.Lock()
     vt_jobs, other_jobs = [], []
 
@@ -501,7 +530,7 @@ def enrich(iocs, keys, cache, vt_rate=4, lookups=None, sleep=time.sleep, clock=t
         for source in SOURCES_FOR_TYPE[ioc["type"]]:
             if source in KEY_ENV_VARS and not keys.get(source):
                 if source not in disabled:
-                    disabled.add(source)
+                    disabled[source] = "No API key"
                     log(f"Warning: {KEY_ENV_VARS[source]} not set, skipping {SOURCE_LABELS[source]}")
                 results[idx, source] = _result(source, "skipped", reason="No API key")
                 continue
@@ -517,16 +546,23 @@ def enrich(iocs, keys, cache, vt_rate=4, lookups=None, sleep=time.sleep, clock=t
         idx, ioc, source = job
         with lock:
             if source in disabled:
-                results[idx, source] = _result(source, "skipped", reason="Invalid API key")
+                results[idx, source] = _result(source, "skipped", reason=disabled[source])
                 return
         try:
             result = funcs[source](ioc)
         except AuthError:
             with lock:
                 if source not in disabled:
-                    disabled.add(source)
+                    disabled[source] = "Invalid API key"
                     log(f"Warning: {SOURCE_LABELS[source]} rejected the API key, disabling it")
             result = _result(source, "skipped", reason="Invalid API key")
+        except Exception as err:  # one bad lookup must never abort the run
+            result = _result(source, "error", reason=f"unexpected error: {err}")
+        if result["status"] == "error" and result["reason"].startswith("rate limited"):
+            with lock:
+                if source not in disabled:
+                    disabled[source] = "Rate limit reached"
+                    log(f"Warning: {SOURCE_LABELS[source]} rate limit reached, skipping its remaining lookups")
         with lock:
             results[idx, source] = result
             cache.set(cache_key(source, ioc), result)
@@ -581,7 +617,7 @@ def exit_code(verdict):
     return {"Medium": 1, "High": 2, "Critical": 2}.get(verdict, 0)
 
 
-def build_results(source_name, text, iocs, skipped, offline):
+def build_results(source_name, raw, iocs, skipped, offline):
     """Assemble the single results dict that all three outputs are rendered from."""
     ordered = sorted(iocs, key=lambda i: (i["score"] is None, -(i["score"] or 0)))
     if offline:
@@ -593,7 +629,7 @@ def build_results(source_name, text, iocs, skipped, offline):
               for i in ordered for s in i["sources"] if s["status"] == "error"]
     return {
         "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "input": {"source": source_name, "sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()},
+        "input": {"source": source_name, "sha256": hashlib.sha256(raw if isinstance(raw, bytes) else raw.encode("utf-8")).hexdigest()},
         "offline": offline,
         "overall": overall,
         "counts": {"found": len(iocs) + len(skipped), "enriched": len(iocs), "skipped": len(skipped)},
@@ -616,6 +652,8 @@ def _fmt_data(data):
     for key, val in data.items():
         if val in (None, "", []):
             continue
+        if key == "hostnames":
+            val = [defang(h) for h in val]
         parts.append(f"{key}: {', '.join(map(str, val)) if isinstance(val, list) else val}")
     return "; ".join(parts)
 
@@ -717,8 +755,17 @@ def write_reports(results, outdir, md, js):
 # CLI
 # ---------------------------------------------------------------------------
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on bad usage, which would read as 'High'; use 3 (runtime failure)."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(3)
+
+
 def parse_args(argv):
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         description="Extract IoCs from text, enrich them with threat intel and write a scored report.")
     parser.add_argument("input", nargs="?", help="file to analyse (reads stdin if omitted)")
     parser.add_argument("--json", action="store_true", help="also write a JSON report")
@@ -730,16 +777,29 @@ def parse_args(argv):
 
 
 def main(argv=None):
+    """Run the CLI and return the exit code. Any unexpected failure returns 3, never a verdict code."""
     args = parse_args(argv)
+    if args.vt_rate <= 0:
+        print("Error: --vt-rate must be greater than 0", file=sys.stderr)
+        return 3
+    try:
+        return _run(args)
+    except Exception as err:
+        print(f"Error: {type(err).__name__}: {err}", file=sys.stderr)
+        return 3
+
+
+def _run(args):
     if args.input:
         try:
-            text = Path(args.input).read_bytes().decode("utf-8", errors="replace")
+            raw = Path(args.input).read_bytes()
         except OSError as err:
             print(f"Error: cannot read {args.input}: {err.strerror or err}", file=sys.stderr)
             return 3
         source_name = args.input
     else:
-        text, source_name = sys.stdin.read(), "stdin"
+        raw, source_name = sys.stdin.buffer.read(), "stdin"
+    text = raw.decode("utf-8", errors="replace")
 
     extracted = extract_iocs(text)
     if args.offline:
@@ -751,7 +811,7 @@ def main(argv=None):
         iocs = enrich(extracted["iocs"], keys, cache, vt_rate=args.vt_rate)
         cache.save()
 
-    results = build_results(source_name, text, iocs, extracted["skipped"], args.offline)
+    results = build_results(source_name, raw, iocs, extracted["skipped"], args.offline)
     print(render_terminal(results, color=sys.stdout.isatty()))
     for path in write_reports(results, Path.cwd(), md=not args.no_md, js=args.json):
         print(f"Report written: {path}")

@@ -518,7 +518,7 @@ class TestCli(unittest.TestCase):
             self.assertEqual(ie.main(["does_not_exist.txt"]), 3)
 
     def test_stdin_input(self):
-        with mock.patch("sys.stdin", io.StringIO("CVE-2021-44228")):
+        with mock.patch("sys.stdin", io.TextIOWrapper(io.BytesIO(b"CVE-2021-44228"))):
             self.assertEqual(ie.main(["--offline", "--json", "--no-md"]), 0)
         data = json.loads(next(Path.cwd().glob("ioc_report_*.json")).read_text())
         self.assertEqual(data["input"]["source"], "stdin")
@@ -538,6 +538,139 @@ class TestCli(unittest.TestCase):
         self.assertEqual(args[1], {"virustotal": "v", "abuseipdb": "a"})
         self.assertEqual(kwargs["vt_rate"], 500)
         self.assertFalse(args[2].enabled)
+
+
+class TestReviewFixes(unittest.TestCase):
+    """Regression tests for findings from the final branch review."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        self.out = mock.patch("sys.stdout", new_callable=io.StringIO)
+        self.err = mock.patch("sys.stderr", new_callable=io.StringIO)
+        self.out.start()
+        self.err.start()
+
+    def tearDown(self):
+        self.err.stop()
+        self.out.stop()
+        os.chdir(self.old_cwd)
+        self.tmp.cleanup()
+
+    def _vals(self, text, t):
+        return [i["value"] for i in ie.extract_iocs(text)["iocs"] if i["type"] == t]
+
+    # 1. Bracketed IPv6 URLs
+    def test_bracketed_ipv6_url(self):
+        text = "see http://[2606:4700::1111]/x now"
+        self.assertEqual(self._vals(text, "url"), ["http://[2606:4700::1111]/x"])
+        self.assertIn("2606:4700::1111", self._vals(text, "ip"))
+
+    def test_malformed_ipv6_url_does_not_crash(self):
+        ie.extract_iocs("broken http://[2606:4700 link")
+
+    # 2. IDN domains and unexpected lookup exceptions
+    def test_idn_domain_punycoded(self):
+        self.assertEqual(self._vals("http://аpple.com/login", "domain"), ["xn--pple-43d.com"])
+
+    def test_unexpected_lookup_exception_is_error(self):
+        def boom(ioc):
+            raise RuntimeError("kaboom")
+        res = ie.enrich([{"type": "cve", "value": "CVE-1-1"}], {}, ie.Cache(Path("c.json"), enabled=False),
+                        lookups={"cvedb": boom}, log=lambda *a: None)
+        self.assertEqual(res[0]["sources"][0]["status"], "error")
+        self.assertIn("kaboom", res[0]["sources"][0]["reason"])
+
+    # 3. Runtime failures exit 3, never a verdict code
+    def test_unexpected_crash_returns_3(self):
+        Path("in.txt").write_text("8.8.8.8")
+        with mock.patch.object(ie, "extract_iocs", side_effect=RuntimeError("bug")):
+            self.assertEqual(ie.main(["in.txt", "--offline"]), 3)
+
+    def test_bad_vt_rate_returns_3(self):
+        Path("in.txt").write_text("8.8.8.8")
+        self.assertEqual(ie.main(["in.txt", "--vt-rate", "0"]), 3)
+
+    def test_bad_flag_exits_3(self):
+        with self.assertRaises(SystemExit) as ctx:
+            ie.main(["--bogus"])
+        self.assertEqual(ctx.exception.code, 3)
+
+    def test_non_dict_body_is_error(self):
+        r = ie.lookup_virustotal({"type": "hash", "value": "a" * 32}, "k", http=fake((200, [], {})))
+        self.assertEqual(r["status"], "error")
+
+    def test_negative_retry_after(self):
+        sleeps = []
+        ie.lookup_internetdb({"type": "ip", "value": "8.8.8.8"},
+                             http=fake((429, None, {"Retry-After": "-3"}), (404, None, {})), sleep=sleeps.append)
+        self.assertEqual(sleeps, [0])
+
+    def test_cache_bad_timestamp_is_miss(self):
+        c = ie.Cache(Path("c.json"))
+        c.entries["k"] = {"ts": "yesterday", "result": {"status": "ok"}}
+        self.assertIsNone(c.get("k"))
+
+    # 4. Non-UTF-8 stdin
+    def test_non_utf8_stdin(self):
+        stdin = io.TextIOWrapper(io.BytesIO(b"http://evil.com/a\xffb 8.8.8.8"))
+        with mock.patch("sys.stdin", stdin):
+            self.assertEqual(ie.main(["--offline", "--json"]), 0)
+
+    # 5. VT with no analysis is not Clean
+    def test_vt_zero_engines_not_clean(self):
+        body = {"data": {"attributes": {"last_analysis_stats": {}}}}
+        r = ie.lookup_virustotal({"type": "domain", "value": "new.xyz"}, "k", http=fake((200, body, {})))
+        self.assertEqual((r["status"], r["score"], r["reason"]), ("not_found", None, "VT: no analysis yet"))
+
+    # 6. Long Retry-After does not hang; exhausted quota disables the source
+    def test_long_retry_after_not_slept(self):
+        sleeps = []
+        r = ie.lookup_abuseipdb({"type": "ip", "value": "8.8.8.8"}, "k",
+                                http=fake((429, None, {"Retry-After": "86400"})), sleep=sleeps.append)
+        self.assertEqual(sleeps, [])
+        self.assertEqual((r["status"], r["reason"]), ("error", "rate limited, retry after 86400 s"))
+
+    def test_rate_limited_source_disabled(self):
+        calls = []
+
+        def limited(ioc):
+            calls.append(ioc)
+            return {"source": "virustotal", "status": "error", "score": None,
+                    "reason": "rate limited", "data": {}, "link": ""}
+        res = ie.enrich([{"type": "hash", "value": c * 32} for c in "abc"], {"virustotal": "k"},
+                        ie.Cache(Path("c.json"), enabled=False), lookups={"virustotal": limited},
+                        sleep=lambda s: None, log=lambda *a: None)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([r["sources"][0]["reason"] for r in res[1:]], ["Rate limit reached"] * 2)
+
+    # 7. Reserved IPv6 and IPv4-mapped addresses
+    def test_reserved_ipv6_not_enriched(self):
+        self.assertEqual(self._vals("std::vector abc::def dead::beef", "ip"), [])
+
+    def test_ipv4_mapped_not_truncated(self):
+        self.assertEqual(self._vals("from ::ffff:8.8.8.8 port", "ip"), ["8.8.8.8"])
+
+    def test_ipv6_end_of_sentence(self):
+        self.assertEqual(self._vals("resolver 2606:4700::1111.", "ip"), ["2606:4700::1111"])
+
+    # 9. Hostnames in details are defanged
+    def test_hostnames_defanged_in_markdown(self):
+        iocs = [{"type": "ip", "value": "8.8.8.8", "score": 0, "verdict": "Clean", "reason": "r",
+                 "sources": [{"source": "internetdb", "status": "ok", "score": 0, "reason": "r",
+                              "data": {"hostnames": ["evil.com"]}, "link": ""}]}]
+        md = ie.render_markdown(ie.build_results("x", b"x", iocs, [], False))
+        self.assertIn("evil[.]com", md)
+        self.assertNotIn("evil.com", md)
+
+    # 13. Input hash matches the raw file bytes
+    def test_input_sha256_of_raw_bytes(self):
+        raw = b"\xff 8.8.8.8"
+        Path("raw.log").write_bytes(raw)
+        ie.main(["raw.log", "--offline", "--no-md", "--json"])
+        data = json.loads(next(Path.cwd().glob("ioc_report_*.json")).read_text())
+        self.assertEqual(data["input"]["sha256"], hashlib.sha256(raw).hexdigest())
 
 
 if __name__ == "__main__":
