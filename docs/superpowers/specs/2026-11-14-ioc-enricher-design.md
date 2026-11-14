@@ -11,12 +11,9 @@ ticket description, or log dump), extracts Indicators of Compromise, enriches
 them against threat intelligence sources, and produces a scored, explainable
 report an analyst can paste straight into a ticket.
 
-It serves two audiences:
-
-1. **Portfolio** — readable, well-tested code that demonstrates SOC automation.
-   Must work out of the box with a bundled sample and no API keys.
-2. **Real use** — handles defanged input, rate limits, caching and API failures
-   properly, and integrates with automation via JSON output and exit codes.
+It works out of the box with a bundled sample and no API keys, handles
+defanged input, rate limits, caching and API failures, and integrates with
+automation via JSON output and exit codes.
 
 ## Constraints
 
