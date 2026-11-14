@@ -135,6 +135,9 @@ Per-source score (0–100):
   than `ok` contribute no score).
 - **Verdict bands**: Clean 0–9 · Low 10–39 · Medium 40–69 · High 70–89 ·
   Critical 90–100 · **Unknown** if no source returned `ok`.
+- **Clean requires a reputation source** (VirusTotal, AbuseIPDB or CVEDB). If
+  only Shodan InternetDB returned data and the score is under 10, the verdict is
+  Unknown with reason suffix `(no reputation data)`.
 - **Overall score** = highest per-IoC score; overall verdict from the same
   bands (Unknown only if every IoC is Unknown, or no IoCs found).
 - Every score carries a human-readable reason, e.g.
